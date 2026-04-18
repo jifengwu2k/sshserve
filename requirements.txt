@@ -1,0 +1,7 @@
+ctypes-unicode-proclaunch
+enum34; python_version < '3.4'
+fspathverbs
+get-unicode-shell
+read-unicode-environment-variables-dictionary
+paramiko
+typing; python_version < '3.5'
