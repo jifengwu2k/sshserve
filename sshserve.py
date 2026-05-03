@@ -753,7 +753,11 @@ def handle_session_channel(channel, state, server):
             return
         if state.subsystem == SFTP_SUBSYSTEM_NAME:
             return
-        command_text = state.exec_command.decode('utf-8')
+        command_value = state.exec_command
+        if command_value is None:
+            command_text = None
+        else:
+            command_text = command_value.decode('utf-8')
         if state.pty_requested:
             run_pty_command(channel, state, command_text)
         else:

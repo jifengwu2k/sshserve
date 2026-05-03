@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sshserve"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Userland non-daemon SSH server inheriting current user privileges, with shell, exec, SFTP, and TCP forwarding on POSIX systems."
 readme = "README.md"
 requires-python = ">=2"
