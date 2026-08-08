@@ -23,11 +23,28 @@ pip install sshshare
 
 ## Usage
 
-Start the server:
+### Quick start (no auth, auto host key)
+
+If you have `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`, just run:
+
+```bash
+sshserve
+```
+
+This auto-discovers your host key and accepts any authentication.
+
+### With explicit host key
 
 ```bash
 ssh-keygen -t ed25519 -f host_ed25519
-sshserve --username alice --password secret --host 127.0.0.1 --port 2222 --host-key host_ed25519
+sshserve --host-ed25519-key host_ed25519
+```
+
+### With authentication
+
+```bash
+ssh-keygen -t ed25519 -f host_ed25519
+sshserve --username alice --password secret --host 127.0.0.1 --port 2222 --host-ed25519-key host_ed25519
 ```
 
 Connect from another terminal with SFTP:
@@ -60,11 +77,11 @@ Use remote port forwarding through the server:
 ssh -R 9090:127.0.0.1:90 -p 2222 alice@127.0.0.1
 ```
 
-Use a passphrase-protected Ed25519 host key:
+Use an RSA host key or a passphrase-protected host key:
 
 ```bash
-ssh-keygen -t ed25519 -f host_ed25519
-sshserve --username alice --password secret --host 127.0.0.1 --port 2222 --host-key host_ed25519 --host-key-passphrase your-passphrase
+ssh-keygen -t rsa -f host_rsa
+sshserve --host-rsa-key host_rsa --host-key-passphrase your-passphrase
 ```
 
 Notes:
@@ -73,10 +90,10 @@ Notes:
 - Accessible files and directories are whatever the current OS user running `sshserve` can access.
 - Shell sessions and exec commands inherit the current user privileges.
 - Shell sessions and exec commands start in the current working directory of the `sshserve` process.
-- Password authentication is supported and `--username` / `--password` are required.
+- `--username` and `--password` are optional. When omitted, any authentication (none, password, publickey) is accepted.
+- Host key is auto-discovered from `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`. Override with `--host-ed25519-key` or `--host-rsa-key`.
 - PTY shell access is supported on POSIX systems.
 - Direct TCP forwarding and reverse TCP forwarding are supported.
-- `--host-key` is required and must point to an Ed25519 private key file.
 - This implementation is POSIX-only because process launching uses `ctypes-unicode-proclaunch` and PTY handling uses POSIX APIs.
 
 ## Contributing

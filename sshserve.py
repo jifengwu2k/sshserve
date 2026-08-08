@@ -4,11 +4,13 @@ from __future__ import print_function
 
 import argparse
 import ctypes
+import errno
 import logging
 import fcntl
 import os
 import pty
 import select
+import signal
 import socket
 import struct
 import sys
@@ -27,8 +29,15 @@ DEFAULT_PORT = 2222
 DEFAULT_LISTEN_BACKLOG = 100
 DEFAULT_CHANNEL_WAIT_TIMEOUT_SECONDS = 30.0
 DEFAULT_SELECT_TIMEOUT_SECONDS = 1.0
+FORWARD_MONITOR_INTERVAL_SECONDS = 0.1
+FORWARD_THREAD_JOIN_TIMEOUT_SECONDS = 2.0
+FORWARD_CONNECT_TIMEOUT_SECONDS = 15.0
+PROCESS_POLL_INTERVAL_SECONDS = 0.1
+PROCESS_TERMINATE_GRACE_SECONDS = 2.0
 SESSION_CHANNEL_KIND = 'session'
 SFTP_SUBSYSTEM_NAME = 'sftp'
+DEFAULT_ED25519_KEY_USER_PATH = os.path.join(os.path.expanduser('~'), '.ssh', 'id_ed25519')
+DEFAULT_RSA_KEY_USER_PATH = os.path.join(os.path.expanduser('~'), '.ssh', 'id_rsa')
 
 LIBC_SETSID = proclaunch.libc.setsid
 LIBC_SETSID.restype = ctypes.c_int
@@ -40,8 +49,14 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 LOGGER = logging.getLogger(__name__)
 
 
-def launch_pty_process(arguments, slave_file_descriptor):
-    # type: (Sequence[str], int) -> int
+def launch_session_process(
+        arguments,
+        stdin_file_descriptor,
+        stdout_file_descriptor,
+        stderr_file_descriptor,
+        controlling_terminal_file_descriptor=None,
+        child_close_file_descriptors=()):
+    # type: (Sequence[str], int, int, int, Optional[int], Sequence[int]) -> int
     environment = read_unicode_environment_variables_dictionary()
     executable_path = next(proclaunch.find_unicode_executable(arguments[0]), None)
     if executable_path is None:
@@ -62,24 +77,31 @@ def launch_pty_process(arguments, slave_file_descriptor):
                 error_number = ctypes.get_errno()
                 sys.stderr.write('setsid failed: %s\n' % os.strerror(error_number))
                 proclaunch._exit(1)
-            if LIBC_IOCTL(slave_file_descriptor, termios.TIOCSCTTY, 0) < 0:
-                error_number = ctypes.get_errno()
-                sys.stderr.write('TIOCSCTTY failed: %s\n' % os.strerror(error_number))
-                proclaunch._exit(1)
-            if proclaunch.dup2(slave_file_descriptor, 0) < 0:
-                error_number = ctypes.get_errno()
-                sys.stderr.write('dup2 stdin failed: %s\n' % os.strerror(error_number))
-                proclaunch._exit(1)
-            if proclaunch.dup2(slave_file_descriptor, 1) < 0:
-                error_number = ctypes.get_errno()
-                sys.stderr.write('dup2 stdout failed: %s\n' % os.strerror(error_number))
-                proclaunch._exit(1)
-            if proclaunch.dup2(slave_file_descriptor, 2) < 0:
-                error_number = ctypes.get_errno()
-                sys.stderr.write('dup2 stderr failed: %s\n' % os.strerror(error_number))
-                proclaunch._exit(1)
-            if slave_file_descriptor not in [0, 1, 2]:
-                proclaunch.close(slave_file_descriptor)
+            if controlling_terminal_file_descriptor is not None:
+                if LIBC_IOCTL(controlling_terminal_file_descriptor, termios.TIOCSCTTY, 0) < 0:
+                    error_number = ctypes.get_errno()
+                    sys.stderr.write('TIOCSCTTY failed: %s\n' % os.strerror(error_number))
+                    proclaunch._exit(1)
+            redirected_file_descriptors = [
+                (stdin_file_descriptor, 0, 'stdin'),
+                (stdout_file_descriptor, 1, 'stdout'),
+                (stderr_file_descriptor, 2, 'stderr'),
+            ]
+            for source_file_descriptor, target_file_descriptor, stream_name in redirected_file_descriptors:
+                if source_file_descriptor == target_file_descriptor:
+                    continue
+                if proclaunch.dup2(source_file_descriptor, target_file_descriptor) < 0:
+                    error_number = ctypes.get_errno()
+                    sys.stderr.write('dup2 %s failed: %s\n' % (stream_name, os.strerror(error_number)))
+                    proclaunch._exit(1)
+            descriptors_to_close = [
+                stdin_file_descriptor,
+                stdout_file_descriptor,
+                stderr_file_descriptor,
+            ] + list(child_close_file_descriptors)
+            for file_descriptor in set(descriptors_to_close):
+                if file_descriptor not in [0, 1, 2]:
+                    proclaunch.close(file_descriptor)
             proclaunch.execve(executable_path_pointer, argument_array, environment_array)
             error_number = ctypes.get_errno()
             sys.stderr.write('execve failed: %s\n' % os.strerror(error_number))
@@ -91,22 +113,140 @@ def launch_pty_process(arguments, slave_file_descriptor):
     return process_id
 
 
-def wait_for_exit_code(process_id):
+def launch_pty_process(arguments, slave_file_descriptor, master_file_descriptor):
+    # type: (Sequence[str], int, int) -> int
+    return launch_session_process(
+        arguments,
+        slave_file_descriptor,
+        slave_file_descriptor,
+        slave_file_descriptor,
+        controlling_terminal_file_descriptor=slave_file_descriptor,
+        child_close_file_descriptors=[master_file_descriptor],
+    )
+
+
+def process_exit_code_from_wait_status(wait_status):
     # type: (int) -> int
+    if proclaunch.WIFEXITED(wait_status):
+        return proclaunch.WEXITSTATUS(wait_status)
+    if proclaunch.WIFSIGNALED(wait_status):
+        return 128 + proclaunch.WTERMSIG(wait_status)
+    return 1
+
+
+def poll_process_exit_code(process_id):
+    # type: (int) -> Tuple[bool, int]
     wait_status = ctypes.c_int()
     while True:
-        result = proclaunch.waitpid(process_id, ctypes.byref(wait_status), 0)
-        if result < 0:
-            error_number = ctypes.get_errno()
-            if error_number == 4:
+        result = proclaunch.waitpid(process_id, ctypes.byref(wait_status), os.WNOHANG)
+        if result >= 0:
+            break
+        error_number = ctypes.get_errno()
+        if error_number == errno.EINTR:
+            continue
+        raise OSError(error_number, os.strerror(error_number))
+    if result == 0:
+        return False, 0
+    return True, process_exit_code_from_wait_status(wait_status.value)
+
+
+def channel_is_connected(channel):
+    # type: (paramiko.Channel) -> bool
+    if channel.closed or not channel.active:
+        return False
+    transport = channel.transport
+    return transport is not None and transport.is_active()
+
+
+def signal_process(process_id, signal_number, process_group):
+    # type: (int, int, bool) -> None
+    try:
+        if process_group:
+            os.killpg(process_id, signal_number)
+        else:
+            os.kill(process_id, signal_number)
+    except OSError as error:
+        if error.errno != errno.ESRCH:
+            raise
+
+
+def wait_for_exit_code(process_id, channel=None, process_group=False):
+    # type: (int, Optional[paramiko.Channel], bool) -> int
+    termination_signals = [signal.SIGHUP, signal.SIGTERM, signal.SIGKILL]
+    termination_signal_index = 0
+    next_termination_time = None  # type: Optional[float]
+    while True:
+        exited, exit_code = poll_process_exit_code(process_id)
+        if exited:
+            return exit_code
+
+        if channel is not None and not channel_is_connected(channel):
+            current_time = time.time()
+            if next_termination_time is None or current_time >= next_termination_time:
+                if termination_signal_index < len(termination_signals):
+                    if termination_signal_index == 0:
+                        LOGGER.info('[session] client disconnected; terminating process %s' % process_id)
+                    signal_process(
+                        process_id,
+                        termination_signals[termination_signal_index],
+                        process_group,
+                    )
+                    termination_signal_index += 1
+                    next_termination_time = current_time + PROCESS_TERMINATE_GRACE_SECONDS
+
+        time.sleep(PROCESS_POLL_INTERVAL_SECONDS)
+
+
+def terminate_process_and_wait(process_id, process_group):
+    # type: (int, bool) -> int
+    for signal_number in [signal.SIGTERM, signal.SIGKILL]:
+        signal_process(process_id, signal_number, process_group)
+        deadline = time.time() + PROCESS_TERMINATE_GRACE_SECONDS
+        while time.time() < deadline:
+            exited, exit_code = poll_process_exit_code(process_id)
+            if exited:
+                return exit_code
+            time.sleep(PROCESS_POLL_INTERVAL_SECONDS)
+    return wait_for_exit_code(process_id)
+
+
+def write_all(file_descriptor, data):
+    # type: (int, bytes) -> None
+    offset = 0
+    while offset < len(data):
+        try:
+            written_byte_count = os.write(file_descriptor, data[offset:])
+        except OSError as error:
+            if error.errno == errno.EINTR:
                 continue
-            raise OSError(error_number, os.strerror(error_number))
-        break
-    if proclaunch.WIFEXITED(wait_status.value):
-        return proclaunch.WEXITSTATUS(wait_status.value)
-    if proclaunch.WIFSIGNALED(wait_status.value):
-        return 128 + proclaunch.WTERMSIG(wait_status.value)
-    return 1
+            raise
+        if written_byte_count <= 0:
+            raise OSError(errno.EIO, 'write returned no data')
+        offset += written_byte_count
+
+
+def shutdown_socket(sock):
+    # type: (socket.socket) -> None
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+
+
+def close_socket(sock):
+    # type: (socket.socket) -> None
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+def close_channel(channel):
+    # type: (paramiko.Channel) -> None
+    try:
+        channel.close()
+    except Exception:
+        pass
 
 
 def set_winsize(file_descriptor, width, height, pixelwidth, pixelheight):
@@ -167,7 +307,18 @@ class SessionState(object):
 
 
 class RemoteForwardListener(object):
-    __slots__ = ('transport', 'bind_addr', 'bind_port', 'sock', 'bound_port', 'closed_event', 'thread')
+    __slots__ = (
+        'transport',
+        'bind_addr',
+        'bind_port',
+        'sock',
+        'bound_port',
+        'closed_event',
+        'thread',
+        'client_sockets',
+        'worker_threads',
+        'lock',
+    )
 
     def __init__(self, transport, bind_addr, bind_port):
         # type: (paramiko.Transport, str, int) -> None
@@ -184,6 +335,9 @@ class RemoteForwardListener(object):
         self.sock.listen(DEFAULT_LISTEN_BACKLOG)
         self.bound_port = self.sock.getsockname()[1]
         self.closed_event = threading.Event()
+        self.client_sockets = set()
+        self.worker_threads = set()
+        self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.run_loop)
         self.thread.daemon = True
         self.thread.start()
@@ -193,42 +347,88 @@ class RemoteForwardListener(object):
         # type: () -> None
         while not self.closed_event.is_set() and self.transport.is_active():
             try:
-                readable_list, unused_writable_list, unused_error_list = select.select([self.sock], [], [], DEFAULT_SELECT_TIMEOUT_SECONDS)
+                readable_list, unused_writable_list, unused_error_list = select.select(
+                    [self.sock],
+                    [],
+                    [],
+                    DEFAULT_SELECT_TIMEOUT_SECONDS,
+                )
                 if not readable_list:
                     continue
                 client_socket, client_address = self.sock.accept()
             except Exception:
                 if not self.closed_event.is_set():
-                    time.sleep(0.1)
+                    time.sleep(FORWARD_MONITOR_INTERVAL_SECONDS)
                 continue
-            worker_thread = threading.Thread(target=self.handle_client, args=(client_socket, client_address))
-            worker_thread.daemon = True
-            worker_thread.start()
+
+            with self.lock:
+                if self.closed_event.is_set():
+                    close_socket(client_socket)
+                    continue
+                self.client_sockets.add(client_socket)
+                worker_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, client_address),
+                )
+                worker_thread.daemon = True
+                self.worker_threads.add(worker_thread)
+            try:
+                worker_thread.start()
+            except Exception:
+                with self.lock:
+                    self.worker_threads.discard(worker_thread)
+                    self.client_sockets.discard(client_socket)
+                close_socket(client_socket)
+                raise
 
     def handle_client(self, client_socket, client_address):
         # type: (socket.socket, Any) -> None
+        channel = None  # type: Optional[paramiko.Channel]
         try:
+            if self.closed_event.is_set():
+                return
             channel = self.transport.open_forwarded_tcpip_channel(
                 client_address,
                 (self.bind_addr, self.bound_port),
             )
-            if channel is None:
-                client_socket.close()
+            if channel is None or self.closed_event.is_set():
                 return
-            bridge_socket_and_channel(client_socket, channel)
+            bridge_socket_and_channel(
+                client_socket,
+                channel,
+                cancellation_event=self.closed_event,
+            )
         except Exception:
-            try:
-                client_socket.close()
-            except Exception:
-                pass
+            if not self.closed_event.is_set() and self.transport.is_active():
+                LOGGER.debug('[reverse] forwarded connection failed', exc_info=True)
+        finally:
+            if channel is not None:
+                close_channel(channel)
+            close_socket(client_socket)
+            with self.lock:
+                self.client_sockets.discard(client_socket)
+                self.worker_threads.discard(threading.current_thread())
 
     def close(self):
         # type: () -> None
         self.closed_event.set()
-        try:
-            self.sock.close()
-        except Exception:
-            pass
+        close_socket(self.sock)
+        with self.lock:
+            client_sockets = list(self.client_sockets)
+            worker_threads = list(self.worker_threads)
+        for client_socket in client_sockets:
+            shutdown_socket(client_socket)
+            close_socket(client_socket)
+
+        threads = [self.thread] + worker_threads
+        deadline = time.time() + FORWARD_THREAD_JOIN_TIMEOUT_SECONDS
+        for thread_object in threads:
+            if thread_object is threading.current_thread():
+                continue
+            remaining_time = deadline - time.time()
+            if remaining_time <= 0:
+                break
+            thread_object.join(remaining_time)
 
 
 class SSHShareServer(paramiko.ServerInterface):
@@ -240,10 +440,11 @@ class SSHShareServer(paramiko.ServerInterface):
         'direct_tcpip',
         'reverse_forwards',
         'lock',
+        'auth_required',
     )
 
     def __init__(self, login_username_text, login_password_text, transport):
-        # type: (str, str, paramiko.Transport) -> None
+        # type: (Optional[str], Optional[str], paramiko.Transport) -> None
         self.login_username_text = login_username_text
         self.login_password_text = login_password_text
         self.transport = transport
@@ -251,16 +452,33 @@ class SSHShareServer(paramiko.ServerInterface):
         self.direct_tcpip = {}  # type: Dict[int, Tuple[Tuple[str, int], Tuple[str, int]]]
         self.reverse_forwards = {}  # type: Dict[Tuple[str, int], RemoteForwardListener]
         self.lock = threading.Lock()
+        self.auth_required = login_username_text is not None and login_password_text is not None
+
+    def check_auth_none(self, username):
+        # type: (str) -> int
+        if self.auth_required:
+            return paramiko.AUTH_FAILED
+        return paramiko.AUTH_SUCCESSFUL
 
     def check_auth_password(self, username, password):
         # type: (str, str) -> int
+        if not self.auth_required:
+            return paramiko.AUTH_SUCCESSFUL
         if username == self.login_username_text and password == self.login_password_text:
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
+
+    def check_auth_publickey(self, username, key):
+        # type: (str, paramiko.PKey) -> int
+        if not self.auth_required:
             return paramiko.AUTH_SUCCESSFUL
         return paramiko.AUTH_FAILED
 
     def get_allowed_auths(self, username):
         # type: (str) -> str
-        return 'password'
+        if self.auth_required:
+            return 'password'
+        return 'none,password,publickey'
 
     def check_channel_request(self, kind, chanid):
         # type: (str, int) -> int
@@ -500,75 +718,116 @@ class SSHShareSFTPServer(paramiko.SFTPServerInterface):
 
 
 
-def bridge_socket_and_channel(sock, channel):
-    # type: (socket.socket, paramiko.Channel) -> None
+def bridge_socket_and_channel(sock, channel, cancellation_event=None):
+    # type: (socket.socket, paramiko.Channel, Optional[threading.Event]) -> None
+    cancel_event = threading.Event()
+    socket_to_channel_done = threading.Event()
+    channel_to_socket_done = threading.Event()
+
+    def cancellation_requested():
+        # type: () -> bool
+        return cancel_event.is_set() or (
+            cancellation_event is not None and cancellation_event.is_set()
+        )
+
     def pump_socket_to_channel():
         # type: () -> None
         try:
-            while True:
+            while not cancellation_requested():
                 data = sock.recv(32768)
                 if not data:
                     break
                 channel.sendall(data)
         except Exception:
-            pass
+            if not cancellation_requested():
+                LOGGER.debug('[forward] socket-to-channel relay failed', exc_info=True)
+            cancel_event.set()
         finally:
             try:
                 channel.shutdown_write()
             except Exception:
                 pass
+            socket_to_channel_done.set()
 
     def pump_channel_to_socket():
         # type: () -> None
         try:
-            while True:
+            while not cancellation_requested():
                 data = channel.recv(32768)
                 if not data:
                     break
                 sock.sendall(data)
         except Exception:
-            pass
+            if not cancellation_requested():
+                LOGGER.debug('[forward] channel-to-socket relay failed', exc_info=True)
+            cancel_event.set()
         finally:
             try:
                 sock.shutdown(socket.SHUT_WR)
             except Exception:
                 pass
+            channel_to_socket_done.set()
 
-    left_thread = threading.Thread(target=pump_socket_to_channel)
-    right_thread = threading.Thread(target=pump_channel_to_socket)
-    left_thread.daemon = True
-    right_thread.daemon = True
-    left_thread.start()
-    right_thread.start()
-    left_thread.join()
-    right_thread.join()
+    threads = [
+        threading.Thread(target=pump_socket_to_channel),
+        threading.Thread(target=pump_channel_to_socket),
+    ]
+    started_threads = []  # type: List[threading.Thread]
+    for thread_object in threads:
+        thread_object.daemon = True
+
     try:
-        channel.close()
-    except Exception:
-        pass
-    try:
-        sock.close()
-    except Exception:
-        pass
+        for thread_object in threads:
+            thread_object.start()
+            started_threads.append(thread_object)
+
+        while not (
+                socket_to_channel_done.is_set()
+                and channel_to_socket_done.is_set()):
+            if cancellation_requested() or not channel_is_connected(channel):
+                cancel_event.set()
+                shutdown_socket(sock)
+                close_channel(channel)
+                break
+            cancel_event.wait(FORWARD_MONITOR_INTERVAL_SECONDS)
+    finally:
+        cancel_event.set()
+        shutdown_socket(sock)
+        close_channel(channel)
+        close_socket(sock)
+
+        deadline = time.time() + FORWARD_THREAD_JOIN_TIMEOUT_SECONDS
+        for thread_object in started_threads:
+            remaining_time = deadline - time.time()
+            if remaining_time <= 0:
+                break
+            thread_object.join(remaining_time)
+        for thread_object in started_threads:
+            if thread_object.is_alive():
+                LOGGER.warning('[forward] relay thread did not stop after cancellation')
 
 
 def handle_direct_tcpip_channel(channel, origin, destination):
     # type: (paramiko.Channel, Tuple[str, int], Tuple[str, int]) -> None
+    upstream_socket = None  # type: Optional[socket.socket]
     try:
         if ':' in destination[0]:
             family = socket.AF_INET6
         else:
             family = socket.AF_INET
         upstream_socket = socket.socket(family, socket.SOCK_STREAM)
+        upstream_socket.settimeout(FORWARD_CONNECT_TIMEOUT_SECONDS)
         upstream_socket.connect((destination[0], destination[1]))
+        upstream_socket.settimeout(None)
         LOGGER.info('[forward] %s:%s -> %s:%s' % (origin[0], origin[1], destination[0], destination[1]))
         bridge_socket_and_channel(upstream_socket, channel)
     except Exception:
         LOGGER.exception('[forward] failed %s:%s -> %s:%s' % (origin[0], origin[1], destination[0], destination[1]))
-        try:
-            channel.close()
-        except Exception:
-            pass
+    finally:
+        close_channel(channel)
+        if upstream_socket is not None:
+            shutdown_socket(upstream_socket)
+            close_socket(upstream_socket)
 
 
 def relay_channel_to_file_descriptor(channel, file_descriptor):
@@ -578,7 +837,7 @@ def relay_channel_to_file_descriptor(channel, file_descriptor):
             data = channel.recv(32768)
             if not data:
                 break
-            os.write(file_descriptor, data)
+            write_all(file_descriptor, data)
     except Exception:
         pass
     finally:
@@ -608,6 +867,10 @@ def relay_file_descriptor_to_channel(file_descriptor, channel):
             channel.shutdown_write()
         except Exception:
             pass
+        try:
+            os.close(file_descriptor)
+        except Exception:
+            pass
 
 
 def pump_stream_file_descriptor_to_channel(file_descriptor, send_function):
@@ -634,40 +897,75 @@ def run_pty_command(channel, state, command_text):
         arguments = [shell_text, '-i']
     else:
         arguments = [shell_text, '-lc', command_text]
-    master_file_descriptor, slave_file_descriptor = pty.openpty()
-    state.pty_master_fd = master_file_descriptor
-    set_winsize(master_file_descriptor, state.width, state.height, state.width_pixels, state.height_pixels)
+
+    master_file_descriptor = None  # type: Optional[int]
+    slave_file_descriptor = None  # type: Optional[int]
+    input_file_descriptor = None  # type: Optional[int]
+    output_file_descriptor = None  # type: Optional[int]
     process_id = None  # type: Optional[int]
+    process_reaped = False
+    input_thread = None  # type: Optional[threading.Thread]
+    output_thread = None  # type: Optional[threading.Thread]
     try:
-        process_id = launch_pty_process(arguments, slave_file_descriptor)
-    finally:
+        master_file_descriptor, slave_file_descriptor = pty.openpty()
+        state.pty_master_fd = master_file_descriptor
+        set_winsize(master_file_descriptor, state.width, state.height, state.width_pixels, state.height_pixels)
+        process_id = launch_pty_process(arguments, slave_file_descriptor, master_file_descriptor)
+
+        os.close(slave_file_descriptor)
+        slave_file_descriptor = None
+
+        input_file_descriptor = os.dup(master_file_descriptor)
+        input_thread = threading.Thread(
+            target=relay_channel_to_file_descriptor,
+            args=(channel, input_file_descriptor),
+        )
+        input_thread.daemon = True
+        input_thread.start()
+        input_file_descriptor = None
+
+        output_file_descriptor = os.dup(master_file_descriptor)
+        output_thread = threading.Thread(
+            target=relay_file_descriptor_to_channel,
+            args=(output_file_descriptor, channel),
+        )
+        output_thread.daemon = True
+        output_thread.start()
+        output_file_descriptor = None
+
+        exit_code = wait_for_exit_code(process_id, channel, process_group=True)
+        process_reaped = True
+        if output_thread is not None:
+            output_thread.join(1.0)
         try:
-            os.close(slave_file_descriptor)
+            channel.send_exit_status(exit_code)
         except Exception:
             pass
-
-    input_thread = threading.Thread(target=relay_channel_to_file_descriptor, args=(channel, os.dup(master_file_descriptor)))
-    output_thread = threading.Thread(target=relay_file_descriptor_to_channel, args=(os.dup(master_file_descriptor), channel))
-    input_thread.daemon = True
-    output_thread.daemon = True
-    input_thread.start()
-    output_thread.start()
-    exit_code = wait_for_exit_code(process_id)
-    input_thread.join(1.0)
-    output_thread.join(1.0)
-    try:
-        channel.send_exit_status(exit_code)
-    except Exception:
-        pass
-    try:
-        os.close(master_file_descriptor)
-    except Exception:
-        pass
-    state.pty_master_fd = None
-    try:
-        channel.close()
-    except Exception:
-        pass
+    finally:
+        if process_id is not None and not process_reaped:
+            try:
+                terminate_process_and_wait(process_id, process_group=True)
+            except Exception:
+                LOGGER.exception('[session] failed to terminate PTY process %s' % process_id)
+        state.pty_master_fd = None
+        for file_descriptor in [
+            slave_file_descriptor,
+            master_file_descriptor,
+            input_file_descriptor,
+            output_file_descriptor,
+        ]:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except Exception:
+                    pass
+        try:
+            channel.close()
+        except Exception:
+            pass
+        for thread_object in [input_thread, output_thread]:
+            if thread_object is not None:
+                thread_object.join(1.0)
 
 
 def run_pipe_command(channel, state, command_text):
@@ -678,68 +976,116 @@ def run_pipe_command(channel, state, command_text):
     else:
         arguments = [shell_text, '-lc', command_text]
 
-    stdin_read_file_descriptor, stdin_write_file_descriptor = proclaunch.create_pipe()
-    stdout_read_file_descriptor, stdout_write_file_descriptor = proclaunch.create_pipe()
-    stderr_read_file_descriptor, stderr_write_file_descriptor = proclaunch.create_pipe()
-
+    stdin_read_file_descriptor = None  # type: Optional[int]
+    stdin_write_file_descriptor = None  # type: Optional[int]
+    stdout_read_file_descriptor = None  # type: Optional[int]
+    stdout_write_file_descriptor = None  # type: Optional[int]
+    stderr_read_file_descriptor = None  # type: Optional[int]
+    stderr_write_file_descriptor = None  # type: Optional[int]
     process_id = None  # type: Optional[int]
-    try:
-        process_id = proclaunch.launch(
-            arguments,
-            None,
-            stdin_read_file_descriptor,
-            stdout_write_file_descriptor,
-            stderr_write_file_descriptor,
-        )
-    finally:
-        try:
-            os.close(stdin_read_file_descriptor)
-        except Exception:
-            pass
-        try:
-            os.close(stdout_write_file_descriptor)
-        except Exception:
-            pass
-        try:
-            os.close(stderr_write_file_descriptor)
-        except Exception:
-            pass
+    process_reaped = False
+    threads = []  # type: List[threading.Thread]
 
-    def channel_to_stdin():
-        # type: () -> None
+    def channel_to_stdin(file_descriptor):
+        # type: (int) -> None
         try:
             while True:
                 data = channel.recv(32768)
                 if not data:
                     break
-                os.write(stdin_write_file_descriptor, data)
+                write_all(file_descriptor, data)
         except Exception:
             pass
         finally:
             try:
-                os.close(stdin_write_file_descriptor)
+                os.close(file_descriptor)
             except Exception:
                 pass
 
-    threads = [
-        threading.Thread(target=channel_to_stdin),
-        threading.Thread(target=pump_stream_file_descriptor_to_channel, args=(stdout_read_file_descriptor, channel.sendall)),
-        threading.Thread(target=pump_stream_file_descriptor_to_channel, args=(stderr_read_file_descriptor, channel.send_stderr)),
-    ]
-    for thread_object in threads:
-        thread_object.daemon = True
-        thread_object.start()
-    exit_code = wait_for_exit_code(process_id)
-    for thread_object in threads:
-        thread_object.join(1.0)
     try:
-        channel.send_exit_status(exit_code)
-    except Exception:
-        pass
-    try:
-        channel.close()
-    except Exception:
-        pass
+        stdin_read_file_descriptor, stdin_write_file_descriptor = proclaunch.create_pipe()
+        stdout_read_file_descriptor, stdout_write_file_descriptor = proclaunch.create_pipe()
+        stderr_read_file_descriptor, stderr_write_file_descriptor = proclaunch.create_pipe()
+
+        process_id = launch_session_process(
+            arguments,
+            stdin_read_file_descriptor,
+            stdout_write_file_descriptor,
+            stderr_write_file_descriptor,
+            child_close_file_descriptors=[
+                stdin_write_file_descriptor,
+                stdout_read_file_descriptor,
+                stderr_read_file_descriptor,
+            ],
+        )
+
+        os.close(stdin_read_file_descriptor)
+        stdin_read_file_descriptor = None
+        os.close(stdout_write_file_descriptor)
+        stdout_write_file_descriptor = None
+        os.close(stderr_write_file_descriptor)
+        stderr_write_file_descriptor = None
+
+        input_thread = threading.Thread(
+            target=channel_to_stdin,
+            args=(stdin_write_file_descriptor,),
+        )
+        input_thread.daemon = True
+        input_thread.start()
+        threads.append(input_thread)
+        stdin_write_file_descriptor = None
+
+        stdout_thread = threading.Thread(
+            target=pump_stream_file_descriptor_to_channel,
+            args=(stdout_read_file_descriptor, channel.sendall),
+        )
+        stdout_thread.daemon = True
+        stdout_thread.start()
+        threads.append(stdout_thread)
+        stdout_read_file_descriptor = None
+
+        stderr_thread = threading.Thread(
+            target=pump_stream_file_descriptor_to_channel,
+            args=(stderr_read_file_descriptor, channel.send_stderr),
+        )
+        stderr_thread.daemon = True
+        stderr_thread.start()
+        threads.append(stderr_thread)
+        stderr_read_file_descriptor = None
+
+        exit_code = wait_for_exit_code(process_id, channel, process_group=True)
+        process_reaped = True
+        for thread_object in threads[1:]:
+            thread_object.join(1.0)
+        try:
+            channel.send_exit_status(exit_code)
+        except Exception:
+            pass
+    finally:
+        if process_id is not None and not process_reaped:
+            try:
+                terminate_process_and_wait(process_id, process_group=True)
+            except Exception:
+                LOGGER.exception('[session] failed to terminate process %s' % process_id)
+        for file_descriptor in [
+            stdin_read_file_descriptor,
+            stdin_write_file_descriptor,
+            stdout_read_file_descriptor,
+            stdout_write_file_descriptor,
+            stderr_read_file_descriptor,
+            stderr_write_file_descriptor,
+        ]:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except Exception:
+                    pass
+        try:
+            channel.close()
+        except Exception:
+            pass
+        for thread_object in threads:
+            thread_object.join(1.0)
 
 
 def handle_session_channel(channel, state, server):
@@ -780,12 +1126,32 @@ def handle_session_channel(channel, state, server):
         server.remove_session(channel.chanid)
 
 
-def load_host_key(host_key_path, host_key_passphrase_text):
-    # type: (str, Optional[str]) -> paramiko.PKey
-    return paramiko.Ed25519Key.from_private_key_file(
-        host_key_path,
-        password=host_key_passphrase_text,
+def discover_host_key():
+    # type: () -> Tuple[str, str]
+    if os.path.exists(DEFAULT_ED25519_KEY_USER_PATH):
+        return (DEFAULT_ED25519_KEY_USER_PATH, 'ed25519')
+    if os.path.exists(DEFAULT_RSA_KEY_USER_PATH):
+        return (DEFAULT_RSA_KEY_USER_PATH, 'rsa')
+    raise Exception(
+        'no host key found; provide --host-ed25519-key or --host-rsa-key, '
+        'or place one at %s or %s'
+        % (DEFAULT_ED25519_KEY_USER_PATH, DEFAULT_RSA_KEY_USER_PATH)
     )
+
+
+def load_host_key(host_key_path, key_type, host_key_passphrase_text):
+    # type: (str, str, Optional[str]) -> paramiko.PKey
+    if key_type == 'ed25519':
+        return paramiko.Ed25519Key.from_private_key_file(
+            host_key_path,
+            password=host_key_passphrase_text,
+        )
+    if key_type == 'rsa':
+        return paramiko.RSAKey.from_private_key_file(
+            host_key_path,
+            password=host_key_passphrase_text,
+        )
+    raise ValueError('unknown key type: %s' % (key_type,))
 
 
 def open_listen_socket(host_text, port_int):
@@ -810,7 +1176,7 @@ def open_listen_socket(host_text, port_int):
 
 
 def handle_client_connection(client_socket, client_address, login_username_text, login_password_text, host_key):
-    # type: (socket.socket, Any, str, str, paramiko.PKey) -> None
+    # type: (socket.socket, Any, Optional[str], Optional[str], paramiko.PKey) -> None
     transport = paramiko.Transport(client_socket)
     transport.add_server_key(host_key)
     transport.set_subsystem_handler(SFTP_SUBSYSTEM_NAME, paramiko.SFTPServer, SSHShareSFTPServer)
@@ -864,12 +1230,13 @@ def handle_client_connection(client_socket, client_address, login_username_text,
 def build_argument_parser():
     # type: () -> argparse.ArgumentParser
     parser = argparse.ArgumentParser(description='Userland non-daemon SSH server inheriting the current user privileges, with shell, exec, SFTP, and TCP forwarding. POSIX only.')
-    parser.add_argument('--username', type=str, required=True, help='Login username accepted by this SSH server.')
-    parser.add_argument('--password', type=str, required=True, help='Login password accepted by this SSH server.')
+    parser.add_argument('--username', type=str, default=None, help='Login username accepted by this SSH server. If not set, any authentication is accepted.')
+    parser.add_argument('--password', type=str, default=None, help='Login password accepted by this SSH server. If not set, any authentication is accepted.')
     parser.add_argument('--host', type=str, default=DEFAULT_HOST, help='Host or IP address to bind.')
     parser.add_argument('--port', type=int, default=DEFAULT_PORT, help='TCP port to listen on.')
-    parser.add_argument('--host-key', type=str, required=True, help='Path to an Ed25519 private host key file.')
-    parser.add_argument('--host-key-passphrase', type=str, default=None, help='Passphrase for --host-key if the Ed25519 private key is encrypted.')
+    parser.add_argument('--host-ed25519-key', type=str, default=None, help='Path to an Ed25519 private host key file; default lookup: %s' % DEFAULT_ED25519_KEY_USER_PATH)
+    parser.add_argument('--host-rsa-key', type=str, default=None, help='Path to an RSA private host key file; default lookup: %s' % DEFAULT_RSA_KEY_USER_PATH)
+    parser.add_argument('--host-key-passphrase', type=str, default=None, help='Passphrase for the host key if it is encrypted.')
     return parser
 
 
@@ -877,18 +1244,34 @@ def main():
     # type: () -> int
     arguments = build_argument_parser().parse_args()
 
-    host_key_path = arguments.host_key  # type: str
     host_key_passphrase_text = arguments.host_key_passphrase  # type: Optional[str]
 
-    host_key = load_host_key(host_key_path, host_key_passphrase_text)
+    if arguments.host_ed25519_key is not None:
+        host_key_path = arguments.host_ed25519_key
+        key_type = 'ed25519'
+    elif arguments.host_rsa_key is not None:
+        host_key_path = arguments.host_rsa_key
+        key_type = 'rsa'
+    else:
+        try:
+            host_key_path, key_type = discover_host_key()
+            LOGGER.info('Auto-discovered host key: %s' % host_key_path)
+        except Exception as error:
+            LOGGER.error(str(error))
+            return 1
+
+    host_key = load_host_key(host_key_path, key_type, host_key_passphrase_text)
     listen_socket = open_listen_socket(arguments.host, arguments.port)
 
     LOGGER.info('Listening on %s:%s' % (arguments.host, arguments.port))
-    LOGGER.info('Login username: %s' % arguments.username)
+    if arguments.username is not None and arguments.password is not None:
+        LOGGER.info('Login username: %s (password auth required)' % arguments.username)
+    else:
+        LOGGER.info('Authentication: any credentials accepted')
     LOGGER.info('SFTP root: /')
     LOGGER.info('Process working directory: %s' % os.getcwd())
     LOGGER.info('Features: shell, exec, PTY, SFTP, direct TCP forwarding, reverse TCP forwarding')
-    LOGGER.info('Host key: %s' % host_key_path)
+    LOGGER.info('Host key: %s (%s)' % (host_key_path, key_type))
 
     try:
         while True:
